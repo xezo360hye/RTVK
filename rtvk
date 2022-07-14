@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2022 Tkachenko Andrii <xezo360hye@gmail.com>
+#
+# This file is part of RTVK
+#
+# RTVK is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# RTVK is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with RTVK. If not, see <http://www.gnu.org/licenses/>.
+
+import os, sys, dotenv, requests
+from praw import Reddit
+from vk_api import VkApi, VkUpload
+from io import BytesIO
+from re import sub
+
+def get_post(url: str) -> Reddit.submission:
+    return Reddit(
+        user_agent=os.getenv('REDDIT_USER_AGENT'),
+        client_id=os.getenv('REDDIT_CLIENT_ID'),
+        client_secret=os.getenv('REDDIT_CLIENT_SECRET')).submission(url=url)
+
+def get_vk_api() -> VkApi:
+    """
+    Setup vk instance
+
+    :return: vk instance
+    """
+    vk_session = VkApi(token=os.getenv('VK_TOKEN'))
+
+    return vk_session.get_api()
+
+def add_queue(url: str, tags: str = '', title: str = '') -> None:
+    """
+    Add url to queue
+
+    :param url: url to add
+    :param tags: list of tags separated by comma
+    :param title: title of post
+    """
+    if not os.path.isfile('queue.txt'):
+        if not os.path.isdir('queue.txt'):
+            open('queue.txt', 'x').close()
+        else:
+            raise Exception('Failed to create queue.txt - is a directory')
+    with open('queue.txt', 'a') as f:
+        f.write(url + ' | ' + tags + ' | ' + title + '\n')
+
+def del_queue() -> None:
+    """
+    Delete first (oldest) entry of queue
+    """
+    with open('queue.txt', 'r') as f:
+        f.readline()        # Skip first line
+        content = f.read()  # Get rest of file
+
+    with open('queue.txt', 'w') as f:
+        f.write(content)
+
+def get_queue() -> (str, list, str):
+    """
+    Get first (oldest) entry of queue
+
+    :return: url, list of tags, title
+    """
+    try:
+        with open('queue.txt', 'r') as f:
+            line = f.readline()
+            url, tags, title = line.split('|')
+            tags = tags.split(',')
+
+        del_queue()
+        return url, tags, title
+    except FileNotFoundError:
+        raise FileNotFoundError('File queue.txt not found. Did you add any entries?') from None
+
+def upload_video(url: str, vk_upload: VkUpload, group_id: int = None) -> str:
+    """
+    Upload video to vk
+
+    :param url: url of video
+    :param vk_upload: VkUpload instance
+
+    :return: attachment URL
+    """
+    # Download video
+    video = requests.get(url).content
+
+    # Download audio
+    audio_url = sub('DASH_.+\.mp4', 'DASH_audio.mp4', url)
+    audio = requests.get(audio_url).content
+
+    # Generate unique filenames
+    uniq = sub('.*/(.*)\?.*$', '\\1', url) + '.mp4'
+    filename_video = '/tmp/rtvk_video_' + uniq
+    filename_audio = '/tmp/rtvk_audio_' + uniq
+    filename_merged = '/tmp/rtvk_merged_' + uniq
+
+    # Save video to file
+    with open(filename_video, 'xb') as f:
+        f.write(video)
+
+    # Save audio to file
+    with open(filename_audio, 'xb') as f:
+        f.write(audio)
+
+    # Merge video and audio
+    os.system(f'ffmpeg -i {filename_video} -i {filename_audio} -c copy {filename_merged}')
+
+    # Upload video
+    upload = vk_upload.video(
+        video_file=filename_merged,
+        group_id=-group_id if group_id else None)
+
+    return 'video' + str(upload['owner_id']) + '_' + str(upload['video_id'])
+    
+def upload_image(url: str, vk_upload: VkUpload, group_id: int = None) -> str:
+    """
+    Upload image to vk
+
+    :param url: url of image
+    :param vk_upload: VkUpload instance
+
+    :return: attachment URL
+    """
+    upload = vk_upload.photo_wall(
+        photos=BytesIO(requests.get(url).content),
+        group_id=-group_id if group_id else None)
+
+    return 'photo' + str(upload[0]['owner_id']) + '_' + str(upload[0]['id'])
+
+def upload_gif(url: str, vk_upload: VkUpload, group_id: int = None) -> str:
+    """
+    Upload gif to vk
+
+    :param url: url of gif
+    :param vk_upload: VkUpload instance
+
+    :return: attachment URL
+    """
+    upload = vk_upload.document_wall(
+        doc=BytesIO(requests.get(url).content),
+        group_id=-group_id if group_id else None)
+
+    return 'doc' + str(upload['owner_id']) + '_' + str(upload['id'])
+
+def get_title(title: str = '', tags: list = [], group_name: str = '') -> str:
+    """
+    Create title for post
+
+    :param title: main title of post
+    :param tags: list of tags to add
+
+    :return: full title
+    """
+    result = title.strip()
+    group_name = group_name.strip()
+
+    # Add empty line between title and tags
+    if len(tags) > 0:
+        result += '\n' * 2
+
+    # Apply tags
+    for tag in tags:
+        result += '#' + tag.strip() + ('@' + group_name if group_name else '') + '\n'
+
+    # Remove last newline
+    return result.strip()
+
+def upload(post: Reddit.submission, vk_upload: VkUpload, group_id: int = None) -> str:
+    """
+    Extract image or video from post and upload it to vk
+
+    :param post: Reddit post submission
+    :param vk_upload: VkUpload instance
+    :param group_id: id of group to upload to (optional)
+
+    :return: attachment URL
+    """
+
+    print(f'Media URL is {post.url}')
+    # Nothing to extract from text (aka self) post
+    if post.is_self:
+        raise Exception('Post is self')
+
+    # If post is video
+    if post.is_video:
+        print('Uploading video...')
+        return upload_video(post.media['reddit_video']['fallback_url'], vk_upload, group_id)
+
+    # If post is gif
+    if post.url.find('.gif') != -1:
+        print('Uploading GIF...')
+        return upload_gif(post.url, vk_upload, group_id)
+
+    # If post is image
+    elif post.url.find('/gallery/') == -1:
+        print('Uploading image...')
+        return upload_image(post.url, vk_upload, group_id)
+
+    # If post is gallery
+    else:
+        print('Uploading gallery...')
+        urls = [i[1]['p'][0]['u'].split('?')[0].replace('preview', 'i') for i in post.media_metadata.items()]
+        result = []
+        for url in urls:
+            result.append(upload_image(url, vk_upload, group_id))
+
+        return ','.join(result)
+
+def post(url: str, tags: list, title: str) -> None:
+    """
+    Post to VK
+
+    :param url: url of Reddit post
+    :param tags: list of tags
+    :param title: title of post
+    """
+    dotenv.load_dotenv()
+    post = get_post(url)
+    vk = get_vk_api()
+    group_id = int(os.getenv('VK_GROUP_ID'))
+    group_name = vk.groups.getById(group_id=-group_id)[0]['screen_name']
+
+    vk.wall.post(
+        owner_id = group_id,
+        from_group = 1,
+        message = get_title(title=title, tags=tags, group_name=group_name),
+        attachments = upload(
+            post = post,
+            vk_upload = VkUpload(vk),
+            group_id = group_id))
+
+def print_help() -> None:
+    """
+    Print help message
+    """
+    print("""
+Usage:
+    rtvk post [<url> <tags> <title>]
+    rtvk add <url> <tags> title>
+
+When using rtvk post and no arguments are given, then rtvk will post the first (oldest) entry of queue. Use rtvk add to add a new entry to queue
+""".strip())
+
+def main() -> bool:
+    if len(sys.argv) == 1 or sys.argv[1] not in ['post', 'add']:
+        print_help()
+        return False
+    
+    match sys.argv[1:]:
+        case ['add', *args] if len(args) >= 3:
+            return add_queue(args[0], args[1], ' '.join(args[2:]))
+
+        case ['post', *args] if len(args) >= 3:
+            url = sys.argv[2]
+            tags = sys.argv[3].split(',')
+            title = ' '.join(sys.argv[4:])
+            return post(url, tags, title)
+
+        case ['post']:
+            # Get first line from queue
+            url, tags, title = get_queue()
+            return post(url, tags, title)
+
+        case 'help' | '-h' | '--help' | _:
+            print_help()
+
+
+if __name__ == '__main__':
+    main()
